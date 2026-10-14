@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "memory": 1024
+    }
+  },
+  "rewrites": [
+    { "source": "/create_user/", "destination": "/api/index" },
+    { "source": "/bulk_create/", "destination": "/api/index" },
+    { "source": "/users/",       "destination": "/api/index" },
+    { "source": "/user/(.*)",    "destination": "/api/index" },
+    { "source": "/logs/",        "destination": "/api/index" },
+    { "source": "/stats/",       "destination": "/api/index" }
+  ]
+}
