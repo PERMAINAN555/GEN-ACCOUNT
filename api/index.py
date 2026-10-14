@@ -6,8 +6,22 @@ from pydantic import BaseModel
 from typing import Optional
 
 from lib.garena import full_flow
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 
 app = FastAPI(title="FF Account API", version="1.2.0")
+
+class StripVercelPrefix(BaseHTTPMiddleware):
+    """Vercel rewrite prepends /api/index - strip before routing."""
+    async def dispatch(self, request: StarletteRequest, call_next):
+        p = request.scope.get("path", "")
+        prefix = "/api/index"
+        if p.startswith(prefix):
+            request.scope["path"] = p[len(prefix):] or "/"
+        return await call_next(request)
+
+
+app.add_middleware(StripVercelPrefix)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
