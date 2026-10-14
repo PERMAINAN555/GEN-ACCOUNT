@@ -25,3 +25,4 @@ accounts.ndjson
 accounts.json
 proxies.txt
 bot.py
+.env*
