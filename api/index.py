@@ -1,33 +1,75 @@
-# api/index.py
+# api/index.py - v2, no supabase SDK (REST only)
 import os, time
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 
 from lib.garena import full_flow
 
-app = FastAPI(title="FF Account API", version="1.1.0")
+app = FastAPI(title="FF Account API", version="1.2.0")
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SB_REST      = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
-if not SUPABASE_URL or not SUPABASE_KEY:
+if not (SB_REST and SUPABASE_KEY):
     raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing")
 
-from supabase import create_client
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def _sb_headers(extra=None):
+    h = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _sb_get(path, params=None):
+    r = httpx.get(f"{SB_REST}/{path}", headers=_sb_headers(), params=params, timeout=15)
+    if r.status_code not in (200, 206):
+        raise RuntimeError(f"supabase GET {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def _sb_post(path, row, prefer="return=representation"):
+    r = httpx.post(
+        f"{SB_REST}/{path}", json=row,
+        headers=_sb_headers({"Prefer": prefer}), timeout=15)
+    if r.status_code not in (200, 201, 204):
+        raise RuntimeError(f"supabase POST {r.status_code}: {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def _sb_delete(path, params):
+    r = httpx.delete(
+        f"{SB_REST}/{path}", headers=_sb_headers({"Prefer": "return=representation"}),
+        params=params, timeout=15)
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"supabase DELETE {r.status_code}: {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        return None
 
 
 def _log(event, **kw):
     try:
-        sb.table("logs").insert({
+        row = {
             "event": event,
             "uid": kw.get("uid"),
             "region": kw.get("region"),
             "error": kw.get("error"),
             "meta": {k: v for k, v in kw.items()
                      if k not in ("uid", "region", "error")} or None,
-        }).execute()
+        }
+        _sb_post("logs", row, prefer="return=minimal")
     except Exception:
         pass
 
@@ -41,8 +83,8 @@ def root():
     return {
         "creator": "DWR",
         "status": "API is running successfully",
-        "version": "1.1.0",
-        "backend": "supabase",
+        "version": "1.2.0",
+        "backend": "supabase-rest",
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "endpoints": [
             "GET  /",
@@ -61,9 +103,8 @@ def root():
 async def create_user(req: CreateReq):
     try:
         acc = await full_flow(region=req.region)
-        sb.table("accounts").insert(acc).execute()
-        _log("create", uid=acc["uid"], region=req.region,
-             account_id=acc["account_id"])
+        _sb_post("accounts", acc, prefer="resolution=merge-duplicates,return=minimal")
+        _log("create", uid=acc["uid"], region=req.region, account_id=acc["account_id"])
         return {"success": True, "user": acc}
     except Exception as e:
         _log("error", error=str(e), region=req.region)
@@ -78,7 +119,7 @@ async def bulk_create(count: int = Query(..., ge=1, le=100),
     for i in range(count):
         try:
             acc = await full_flow(region=region)
-            sb.table("accounts").insert(acc).execute()
+            _sb_post("accounts", acc, prefer="resolution=merge-duplicates,return=minimal")
             _log("create", uid=acc["uid"], region=region, batch=True)
             results.append(acc)
         except Exception as e:
@@ -93,58 +134,53 @@ async def bulk_create(count: int = Query(..., ge=1, le=100),
 def list_users(limit: int = Query(100, ge=1, le=1000),
                offset: int = Query(0, ge=0),
                region: Optional[str] = None):
-    q = sb.table("accounts").select(
-        "uid,nickname,open_id,account_id,region,created_at", count="exact")
-    if region:
-        q = q.eq("region", region)
-    res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-    return {
-        "success": True,
-        "total": res.count,
-        "limit": limit,
-        "offset": offset,
-        "count": len(res.data or []),
-        "users": res.data or [],
+    params = {
+        "select": "uid,nickname,open_id,account_id,region,created_at",
+        "order":  "created_at.desc",
+        "limit":  str(limit),
+        "offset": str(offset),
     }
+    if region:
+        params["region"] = f"eq.{region}"
+    rows = _sb_get("accounts", params)
+    return {"success": True, "count": len(rows), "limit": limit,
+            "offset": offset, "users": rows}
 
 
 @app.get("/user/{uid}")
 def get_user(uid: str):
-    res = sb.table("accounts").select("*").eq("uid", uid).limit(1).execute()
-    if not res.data:
+    rows = _sb_get("accounts", {"uid": f"eq.{uid}", "limit": "1"})
+    if not rows:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"success": True, "user": res.data[0]}
+    return {"success": True, "user": rows[0]}
 
 
 @app.delete("/user/{uid}")
 def delete_user(uid: str):
-    res = sb.table("accounts").delete().eq("uid", uid).execute()
+    rows = _sb_delete("accounts", {"uid": f"eq.{uid}"})
     _log("delete", uid=uid)
-    return {"success": True, "deleted": uid, "rows": len(res.data or [])}
+    return {"success": True, "deleted": uid, "rows": len(rows or [])}
 
 
 @app.get("/logs/")
 def logs(limit: int = Query(100, ge=1, le=1000)):
-    res = (sb.table("logs").select("*")
-             .order("created_at", desc=True)
-             .limit(limit).execute())
-    return {"success": True, "count": len(res.data or []), "logs": res.data or []}
+    rows = _sb_get("logs", {"order": "created_at.desc", "limit": str(limit)})
+    return {"success": True, "count": len(rows), "logs": rows}
 
 
 @app.get("/stats/")
 def stats():
-    total = sb.table("accounts").select("uid", count="exact").execute()
-    rows = sb.table("accounts").select("region").execute().data or []
+    all_rows = _sb_get("accounts", {"select": "uid,region"})
     regions = {}
-    for r in rows:
+    for r in all_rows:
         key = r.get("region") or "UNK"
         regions[key] = regions.get(key, 0) + 1
-    log_count = sb.table("logs").select("id", count="exact").execute()
+    log_rows = _sb_get("logs", {"select": "id"})
     return {
         "success": True,
-        "total_users": total.count or 0,
-        "total_logs": log_count.count or 0,
+        "total_users": len(all_rows),
+        "total_logs": len(log_rows),
         "regions": regions,
-        "backend": "supabase",
+        "backend": "supabase-rest",
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
