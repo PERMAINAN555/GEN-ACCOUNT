@@ -1,5 +1,5 @@
 # lib/garena.py
-import os, json, time, random, hashlib, hmac
+import os, json, time, random, hashlib, hmac, asyncio
 import httpx
 from .proto import (assemble_proto, parse_proto, aes_encrypt, aes_decrypt,
                     xor_open_id, AES_KEY, AES_IV)
@@ -19,6 +19,18 @@ GENERATE_NICKNAME_URL = "https://loginbp.ppmainecoonghj.com/GenerateNickname"
 FIELD_22_HEX = os.environ.get("FIELD_22_HEX", "")
 if not FIELD_22_HEX:
     raise RuntimeError("FIELD_22_HEX env var missing")
+
+_regions_cycle = ["IND", "BD", "SG", "MY", "PK"]
+_region_idx = 0
+
+
+def _rotate_region(preferred):
+    global _region_idx
+    if preferred and preferred != "ID":
+        return preferred
+    r = _regions_cycle[_region_idx % len(_regions_cycle)]
+    _region_idx += 1
+    return r
 
 
 async def _post(client, url, **kw):
@@ -186,19 +198,53 @@ async def send_major_login(client, access_token, open_id, region, platform="4"):
     raise RuntimeError("no JWT")
 
 
-async def full_flow(region="IND", retries=3):
+async def _retry(coro_factory, tries=5, base_delay=2.0, backoff=2.0):
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last = e
+            msg = str(e)
+            is_429 = "429" in msg
+            is_net = any(t in msg.lower() for t in
+                         ("timeout", "connect", "read timed out", "disconnect"))
+            if attempt >= tries:
+                break
+            if is_429:
+                wait = base_delay * (backoff ** (attempt - 1)) + random.uniform(0, 1.5)
+                await asyncio.sleep(wait)
+                continue
+            if is_net:
+                await asyncio.sleep(base_delay * attempt)
+                continue
+            raise
+    raise last
+
+
+async def full_flow(region="IND", retries=5):
     password = hashlib.sha256(os.urandom(32)).hexdigest().upper()
     proxy = os.environ.get("RESIDENTIAL_PROXY") or None
-    kwargs = {"timeout": 30, "verify": False}
+    kwargs = {"timeout": 60, "verify": False}
     if proxy:
         kwargs["proxy"] = proxy
+
     async with httpx.AsyncClient(**kwargs) as client:
-        uid = await register_guest(client, password)
-        access_token, open_id = await get_token(client, uid, password)
-        nickname = await generate_nickname(client, open_id)
-        account_id = await send_major_register(client, nickname, access_token, open_id, region)
-        await send_newbie(client, account_id, 3)
-        jwt, sk, siv = await send_major_login(client, access_token, open_id, region)
+        uid = await _retry(lambda: register_guest(client, password),
+                           tries=retries, base_delay=3.0, backoff=2.0)
+        access_token, open_id = await _retry(lambda: get_token(client, uid, password),
+                                             tries=retries, base_delay=2.0, backoff=1.8)
+        nickname = await _retry(lambda: generate_nickname(client, open_id),
+                                tries=retries, base_delay=2.0, backoff=1.8)
+        account_id = await _retry(
+            lambda: send_major_register(client, nickname, access_token, open_id, region),
+            tries=retries, base_delay=2.0, backoff=1.8)
+        await _retry(lambda: send_newbie(client, account_id, 3),
+                     tries=retries, base_delay=2.0, backoff=1.8)
+        jwt, sk, siv = await _retry(
+            lambda: send_major_login(client, access_token, open_id, region),
+            tries=retries, base_delay=2.0, backoff=1.8)
+
     return {
         "uid": uid, "password": password, "nickname": nickname,
         "open_id": open_id, "access_token": access_token,
